@@ -79,7 +79,7 @@ export async function fetchEndpoints(modelId: string): Promise<string[] | undefi
     }
 }
 
-const FOOTER_HINT = "↑↓ navigate • enter toggle • alt+↑↓ reorder • ctrl+a all • ctrl+x none • ctrl+s save • esc close";
+const FOOTER_HINT = "↑↓ navigate • enter toggle • alt+↑↓ reorder • ctrl+a all • ctrl+x none • ctrl+f fallbacks • ctrl+s save • esc close";
 
 class ProviderRoutingList implements Component {
     private readonly allSlugs: string[];
@@ -87,30 +87,37 @@ class ProviderRoutingList implements Component {
     private filteredIds: string[];
     private cursor = 0;
     private readonly searchInput = new Input();
+    private allowFallbacks: boolean;
     private baseline: string;
     private pendingSave: string | null = null;
     private readonly maxVisible: number;
     private readonly footer: Text;
 
-    onSave?: (enabled: string[]) => void;
+    onSave?: (enabled: string[], allowFallbacks: boolean) => void;
     onCancel?: () => void;
 
     constructor(
         private readonly theme: Theme,
         slugs: string[],
         enabled: string[],
+        allowFallbacks: boolean,
     ) {
         this.allSlugs = slugs;
         this.enabledIds = enabled.filter((slug) => slugs.includes(slug));
+        this.allowFallbacks = allowFallbacks;
         this.filteredIds = slugs;
         this.maxVisible = Math.min(slugs.length, 15);
         this.footer = new Text("", 0, 0);
-        this.baseline = JSON.stringify(this.enabledIds);
+        this.baseline = this.state;
         this.refresh();
     }
 
+    private get state(): string {
+        return JSON.stringify([this.enabledIds, this.allowFallbacks]);
+    }
+
     private get dirty(): boolean {
-        return JSON.stringify(this.enabledIds) !== this.baseline;
+        return this.state !== this.baseline;
     }
 
     getSearchInput(): Input {
@@ -155,7 +162,7 @@ class ProviderRoutingList implements Component {
         const sorted = this.sortedIds();
         this.filteredIds = query ? sorted.filter((slug) => fuzzyMatch(query, slug).matches) : sorted;
         this.cursor = Math.min(this.cursor, Math.max(0, this.filteredIds.length - 1));
-        const base = `  ${this.enabledIds.length}/${this.allSlugs.length} enabled · ${FOOTER_HINT}`;
+        const base = `  ${this.enabledIds.length}/${this.allSlugs.length} enabled · fallbacks ${this.allowFallbacks ? "on" : "off"} · ${FOOTER_HINT}`;
         this.footer.setText(
             this.dirty
                 ? this.theme.fg("dim", `${base} `) + this.theme.fg("warning", "(unsaved)")
@@ -198,9 +205,15 @@ class ProviderRoutingList implements Component {
             return;
         }
 
+        if (matchesKey(data, Key.ctrl("f"))) {
+            this.allowFallbacks = !this.allowFallbacks;
+            this.refresh();
+            return;
+        }
+
         if (matchesKey(data, Key.ctrl("s"))) {
-            this.pendingSave = JSON.stringify(this.enabledIds);
-            this.onSave?.([...this.enabledIds]);
+            this.pendingSave = this.state;
+            this.onSave?.([...this.enabledIds], this.allowFallbacks);
             return;
         }
 
@@ -226,7 +239,7 @@ class ProviderRoutingList implements Component {
     }
 
     markSaved(): void {
-        if (this.pendingSave !== null && JSON.stringify(this.enabledIds) === this.pendingSave) {
+        if (this.pendingSave !== null && this.state === this.pendingSave) {
             this.baseline = this.pendingSave;
             this.pendingSave = null;
             this.refresh();
@@ -275,7 +288,7 @@ export default function (pi: ExtensionAPI) {
             const allSlugs = [...slugs].sort();
             const enabled = configured ? configured.filter((slug) => slugs.has(slug)) : allSlugs;
 
-            async function saveRouting(enabledIds: string[]): Promise<void> {
+            async function saveRouting(enabledIds: string[], allowFallbacks: boolean): Promise<void> {
                 const { allow_fallbacks: _a, only: _o, order: _r, ...preserved } = getRouting(await readModelsJson(), modelId) ?? {};
                 const next = preserved as OpenRouterRouting;
 
@@ -285,12 +298,12 @@ export default function (pi: ExtensionAPI) {
 
                 if (enabledIds.length > 0 && !allEnabled) {
                     next.only = sorted;
-                    next.allow_fallbacks = false;
+                    next.allow_fallbacks = allowFallbacks;
                 }
                 if (!isDefaultOrder) next.order = enabledIds;
 
                 const detail = next.only
-                    ? `${enabledIds.length}/${allSlugs.length} providers`
+                    ? `${enabledIds.length}/${allSlugs.length} providers${allowFallbacks ? ", fallbacks allowed" : ""}`
                     : next.order
                         ? `${enabledIds.length}/${allSlugs.length} providers, priority set`
                         : "default";
@@ -316,9 +329,9 @@ export default function (pi: ExtensionAPI) {
                 container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
                 container.addChild(new Text(theme.fg("accent", theme.bold(`Provider routing — ${modelId}`)), 1, 0));
 
-                const list = new ProviderRoutingList(theme, allSlugs, enabled);
-                list.onSave = (enabledIds) => {
-                    void saveRouting(enabledIds).then(() => list.markSaved());
+                const list = new ProviderRoutingList(theme, allSlugs, enabled, routing?.allow_fallbacks ?? false);
+                list.onSave = (enabledIds, allowFallbacks) => {
+                    void saveRouting(enabledIds, allowFallbacks).then(() => list.markSaved());
                 };
                 list.onCancel = () => done(null);
                 container.addChild(list.getSearchInput());
