@@ -79,7 +79,7 @@ export async function fetchEndpoints(modelId: string): Promise<string[] | undefi
     }
 }
 
-const FOOTER_HINT = "↑↓ navigate • enter toggle • alt+↑↓ reorder • ctrl+a all • ctrl+x none • ctrl+r reset • ctrl+s save • esc close";
+const FOOTER_HINT = "↑↓ navigate • enter toggle • alt+↑↓ reorder • ctrl+a all • ctrl+x none • ctrl+s save • esc close";
 
 class ProviderRoutingList implements Component {
     private readonly allSlugs: string[];
@@ -212,12 +212,6 @@ class ProviderRoutingList implements Component {
 
         if (matchesKey(data, Key.ctrl("x"))) {
             this.enabledIds = [];
-            this.refresh();
-            return;
-        }
-
-        if (matchesKey(data, Key.ctrl("r"))) {
-            this.enabledIds = [...this.allSlugs];
             this.refresh();
             return;
         }
