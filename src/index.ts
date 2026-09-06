@@ -57,7 +57,28 @@ export async function writeRouting(modelId: string, routing: OpenRouterRouting |
     await writeFile(modelsJsonPath(), `${JSON.stringify(config, null, 2)}\n`, "utf8");
 }
 
-export async function fetchEndpoints(modelId: string): Promise<string[] | undefined> {
+export interface ProviderInfo {
+    inputPrice?: number;
+    outputPrice?: number;
+    cacheReadPrice?: number;
+    quantizations: string[];
+    uptime1d?: number;
+}
+
+function parsePrice(value: string | number | undefined): number | undefined {
+    if (value == null) return undefined;
+    const parsed = typeof value === "number" ? value : Number.parseFloat(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function formatUsdPerMillion(rate: number): string {
+    const perMillion = rate * 1_000_000;
+    if (perMillion >= 100) return perMillion.toFixed(0);
+    if (perMillion >= 10) return perMillion.toFixed(1);
+    return perMillion.toFixed(2);
+}
+
+export async function fetchProviders(modelId: string): Promise<{ slugs: string[]; info: Record<string, ProviderInfo> } | undefined> {
     try {
         const response = await fetch(`https://openrouter.ai/api/v1/models/${modelId}/endpoints`, {
             signal: AbortSignal.timeout(10_000),
@@ -66,14 +87,40 @@ export async function fetchEndpoints(modelId: string): Promise<string[] | undefi
         if (!response.ok) return undefined;
         const payload = (await response.json()) as {
             data?: {
-                endpoints?: Array<{ provider_name?: string; tag?: string }>;
+                endpoints?: Array<{
+                    provider_name?: string;
+                    tag?: string;
+                    pricing?: { prompt?: string | number; completion?: string | number; input_cache_read?: string | number };
+                    quantization?: string;
+                    uptime_last_1d?: number | null;
+                }>;
             };
         };
 
-        const slugs = (payload.data?.endpoints ?? [])
-            .map((endpoint) => endpoint.tag?.split("/")[0] ?? endpoint.provider_name?.toLowerCase())
-            .filter((slug): slug is string => Boolean(slug));
-        return [...new Set(slugs)].sort();
+        const info: Record<string, ProviderInfo> = {};
+        for (const endpoint of payload.data?.endpoints ?? []) {
+            const slug = endpoint.tag ?? endpoint.provider_name?.toLowerCase();
+            if (!slug) continue;
+            const meta = (info[slug] ??= { quantizations: [] });
+
+            const inputPrice = parsePrice(endpoint.pricing?.prompt);
+            const outputPrice = parsePrice(endpoint.pricing?.completion);
+            const cacheReadPrice = parsePrice(endpoint.pricing?.input_cache_read);
+            if (inputPrice != null) meta.inputPrice = meta.inputPrice == null ? inputPrice : Math.min(meta.inputPrice, inputPrice);
+            if (outputPrice != null) meta.outputPrice = meta.outputPrice == null ? outputPrice : Math.min(meta.outputPrice, outputPrice);
+            if (cacheReadPrice != null) meta.cacheReadPrice = meta.cacheReadPrice == null ? cacheReadPrice : Math.min(meta.cacheReadPrice, cacheReadPrice);
+
+            if (endpoint.quantization && endpoint.quantization !== "unknown" && !meta.quantizations.includes(endpoint.quantization)) {
+                meta.quantizations.push(endpoint.quantization);
+            }
+
+            if (endpoint.uptime_last_1d != null) {
+                meta.uptime1d = meta.uptime1d == null ? endpoint.uptime_last_1d : Math.min(meta.uptime1d, endpoint.uptime_last_1d);
+            }
+        }
+        for (const meta of Object.values(info)) meta.quantizations.sort();
+
+        return { slugs: Object.keys(info).sort(), info };
     } catch {
         return undefined;
     }
@@ -87,6 +134,7 @@ class ProviderRoutingList implements Component {
     private filteredIds: string[];
     private cursor = 0;
     private readonly searchInput = new Input();
+    private readonly labelWidth: number;
     private allowFallbacks: boolean;
     private baseline: string;
     private pendingSave: string | null = null;
@@ -101,9 +149,11 @@ class ProviderRoutingList implements Component {
         slugs: string[],
         enabled: string[],
         allowFallbacks: boolean,
+        private readonly info: Record<string, ProviderInfo>,
     ) {
         this.allSlugs = slugs;
         this.enabledIds = enabled.filter((slug) => slugs.includes(slug));
+        this.labelWidth = Math.max(...slugs.map((slug) => slug.length), 0);
         this.allowFallbacks = allowFallbacks;
         this.filteredIds = slugs;
         this.maxVisible = Math.min(slugs.length, 15);
@@ -135,6 +185,22 @@ class ProviderRoutingList implements Component {
         return [...this.enabledIds, ...disabled];
     }
 
+    private metaText(slug: string): string {
+        const meta = this.info[slug];
+        if (!meta) return "";
+        const parts: string[] = [];
+        if (meta.inputPrice != null || meta.outputPrice != null) {
+            const input = meta.inputPrice != null ? formatUsdPerMillion(meta.inputPrice) : "?";
+            const output = meta.outputPrice != null ? formatUsdPerMillion(meta.outputPrice) : "?";
+            parts.push(`$${input}/$${output}/1M`);
+        }
+        if (meta.cacheReadPrice != null) parts.push(`$${formatUsdPerMillion(meta.cacheReadPrice)} cache/1M`);
+        const quants = meta.quantizations.filter((quant) => !slug.includes(quant));
+        if (quants.length > 0) parts.push(quants.join(","));
+        if (meta.uptime1d != null) parts.push(`${meta.uptime1d.toFixed(0)}%`);
+        return parts.length > 0 ? this.theme.fg("dim", `  ${parts.join(" · ")}`) : "";
+    }
+
     render(width: number): string[] {
         const lines: string[] = [];
         const start = Math.max(0, Math.min(this.cursor - Math.floor(this.maxVisible / 2), this.filteredIds.length - this.maxVisible));
@@ -146,8 +212,9 @@ class ProviderRoutingList implements Component {
 
             const prefix = isSelected ? this.theme.fg("accent", "❯ ") : "  ";
             const marker = rank >= 0 ? this.theme.fg("accent", "[x]") : this.theme.fg("dim", "[ ]");
-            const slugText = rank >= 0 ? slug : this.theme.fg("dim", slug);
-            lines.push(truncateToWidth(`${prefix}${marker} ${slugText}`, width, "…"));
+            const label = slug.padEnd(this.labelWidth);
+            const slugText = rank >= 0 ? label : this.theme.fg("dim", label);
+            lines.push(truncateToWidth(`${prefix}${marker} ${slugText}${this.metaText(slug)}`, width, "…"));
         }
         if (this.filteredIds.length > this.maxVisible) {
             lines.push(this.theme.fg("dim", `  (${this.cursor + 1}/${this.filteredIds.length})`));
@@ -273,12 +340,11 @@ export default function (pi: ExtensionAPI) {
             const modelId = ctx.model.id.replace(/^openrouter\//, "");
             const theme = ctx.ui.theme;
 
-            const endpoints = await fetchEndpoints(modelId);
+            const fetched = await fetchProviders(modelId);
             const routing = getRouting(await readModelsJson(), modelId);
             const configured = routing?.order ?? routing?.only;
 
-            const slugs = new Set<string>([...(routing?.only ?? []), ...configured ?? []]);
-            for (const slug of endpoints ?? []) slugs.add(slug);
+            const slugs = new Set<string>([...(routing?.only ?? []), ...configured ?? [], ...(fetched?.slugs ?? [])]);
 
             if (slugs.size === 0) {
                 ctx.ui.notify(`No providers found for ${modelId}`, "warning");
@@ -329,7 +395,7 @@ export default function (pi: ExtensionAPI) {
                 container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
                 container.addChild(new Text(theme.fg("accent", theme.bold(`Provider routing — ${modelId}`)), 1, 0));
 
-                const list = new ProviderRoutingList(theme, allSlugs, enabled, routing?.allow_fallbacks ?? false);
+                const list = new ProviderRoutingList(theme, allSlugs, enabled, routing?.allow_fallbacks ?? false, fetched?.info ?? {});
                 list.onSave = (enabledIds, allowFallbacks) => {
                     void saveRouting(enabledIds, allowFallbacks).then(() => list.markSaved());
                 };
