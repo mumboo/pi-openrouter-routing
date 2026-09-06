@@ -2,7 +2,7 @@
 
 Pin which providers [pi](https://pi.dev) uses for an OpenRouter model, interactively, from inside the editor.
 
-![preview](https://raw.githubusercontent.com/mumboo/pi-thinking-preview/refs/heads/master/assets/preview.png)
+![preview](https://raw.githubusercontent.com/mumboo/pi-openrouter-routing/refs/heads/master/assets/preview.png)
 
 ## Install
 
