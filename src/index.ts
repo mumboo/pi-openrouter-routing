@@ -63,6 +63,13 @@ export interface ProviderInfo {
     cacheReadPrice?: number;
     quantizations: string[];
     uptime1d?: number;
+    latencyP50?: number;
+    throughputP50?: number;
+}
+
+interface PageStats {
+    latencyP50?: number;
+    throughputP50?: number;
 }
 
 function parsePrice(value: string | number | undefined): number | undefined {
@@ -78,12 +85,54 @@ function formatUsdPerMillion(rate: number): string {
     return perMillion.toFixed(2);
 }
 
+function parsePageStats(html: string): Record<string, PageStats> {
+    const slugs: { index: number; slug: string }[] = [];
+    const slugRe = /\\"provider_slug\\":\\"([^"\\]+)\\"/g;
+    let match: RegExpExecArray | null;
+    while ((match = slugRe.exec(html)) !== null) slugs.push({ index: match.index, slug: match[1]! });
+
+    const stats: Record<string, PageStats> = {};
+    const statsRe = /\\"stats\\":\{[^{}]*\\"p50_latency\\":([\d.]+)[^{}]*\\"p50_throughput\\":([\d.]+)[^{}]*}/g;
+    while ((match = statsRe.exec(html)) !== null) {
+        const latency = Number.parseFloat(match[1]!);
+        const throughput = Number.parseFloat(match[2]!);
+        let owner: { slug: string } | undefined;
+        for (let i = slugs.length - 1; i >= 0; i--) {
+            if (slugs[i]!.index < match.index) {
+                owner = slugs[i]!;
+                break;
+            }
+        }
+        if (!owner) continue;
+        const meta = (stats[owner.slug] ??= {});
+        if (meta.latencyP50 == null && Number.isFinite(latency)) meta.latencyP50 = latency;
+        if (meta.throughputP50 == null && Number.isFinite(throughput)) meta.throughputP50 = throughput;
+    }
+    return stats;
+}
+
+async function fetchPageStats(modelId: string): Promise<Record<string, PageStats>> {
+    try {
+        const response = await fetch(`https://openrouter.ai/${modelId}`, {
+            signal: AbortSignal.timeout(5_000),
+            headers: { Accept: "text/html" },
+        });
+        if (!response.ok) return {};
+        return parsePageStats(await response.text());
+    } catch {
+        return {};
+    }
+}
+
 export async function fetchProviders(modelId: string): Promise<{ slugs: string[]; info: Record<string, ProviderInfo> } | undefined> {
     try {
-        const response = await fetch(`https://openrouter.ai/api/v1/models/${modelId}/endpoints`, {
-            signal: AbortSignal.timeout(10_000),
-            headers: { Accept: "application/json" },
-        });
+        const [response, pageStats] = await Promise.all([
+            fetch(`https://openrouter.ai/api/v1/models/${modelId}/endpoints`, {
+                signal: AbortSignal.timeout(10_000),
+                headers: { Accept: "application/json" },
+            }),
+            fetchPageStats(modelId),
+        ]);
         if (!response.ok) return undefined;
         const payload = (await response.json()) as {
             data?: {
@@ -117,6 +166,12 @@ export async function fetchProviders(modelId: string): Promise<{ slugs: string[]
             if (endpoint.uptime_last_1d != null) {
                 meta.uptime1d = meta.uptime1d == null ? endpoint.uptime_last_1d : Math.min(meta.uptime1d, endpoint.uptime_last_1d);
             }
+        }
+        for (const [slug, stats] of Object.entries(pageStats)) {
+            const meta = info[slug];
+            if (!meta) continue;
+            meta.latencyP50 ??= stats.latencyP50;
+            meta.throughputP50 ??= stats.throughputP50;
         }
         for (const meta of Object.values(info)) meta.quantizations.sort();
 
@@ -198,6 +253,8 @@ class ProviderRoutingList implements Component {
         const quants = meta.quantizations.filter((quant) => !slug.includes(quant));
         if (quants.length > 0) parts.push(quants.join(","));
         if (meta.uptime1d != null) parts.push(`${meta.uptime1d.toFixed(0)}%`);
+        if (meta.latencyP50 != null) parts.push(`${Math.round(meta.latencyP50)}ms`);
+        if (meta.throughputP50 != null) parts.push(`${Math.round(meta.throughputP50)} tok/s`);
         return parts.length > 0 ? this.theme.fg("dim", `  ${parts.join(" · ")}`) : "";
     }
 
